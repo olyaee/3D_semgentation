@@ -11,34 +11,32 @@ import PIL
 
 class VolumeDataGenerator(keras.utils.Sequence):
   def __init__(self,
-              image_list,
+              img_list,
               gt_list,
               batch_size=1,
               shuffle=True,
-              channels_num=1,
-              classes_num=9,
+              in_ch=1,
+              out_ch=9,
               crop = True,
               dim_crop=(160, 160, 16), 
               bg_threshold=.9, 
-              normalize = True,
-              to_categorical=False,
+              normalize=True,
+              to_categorical=True,
               channels_last=True,
-              gt_includes_bg=False,
               verbose=1):
-    self.image_list = image_list
+    self.img_list = img_list
     self.gt_list = gt_list
     self.batch_size = batch_size
     self.shuffle = shuffle
-    self.channels_num = channels_num
-    self.classes_num = classes_num
-    self.id_list = np.arange(len(self.image_list))
+    self.in_ch = in_ch
+    self.out_ch = out_ch
+    self.id_list = np.arange(len(self.img_list))
     self.crop = crop
     self.dim_crop = dim_crop
     self.bg_threshold = bg_threshold
     self.verbose = verbose
-    self.gt_includes_bg = gt_includes_bg
     if self.crop is False:
-      self.dim_crop = (273, 273, 273) # change it based on the complete dataset
+      self.dim_crop = (224, 224, 224) # change it based on the complete dataset
 
     self.normalize = normalize
     self.to_categorical = to_categorical
@@ -47,7 +45,7 @@ class VolumeDataGenerator(keras.utils.Sequence):
 
   def __len__(self):
     'Denotes the number of batches per epoch'
-    return int(np.floor(len(self.image_list) / self.batch_size))
+    return int(np.floor(len(self.img_list) / self.batch_size))
 
   def on_epoch_end(self):
     'Updates indexes after each epoch'
@@ -56,54 +54,69 @@ class VolumeDataGenerator(keras.utils.Sequence):
 
   def __data_generation(self, indexes):
     'Generates data containing batch_size samples'
-    # Initialization
+    #set output channels
     if self.to_categorical:
-      classes_num = self.classes_num 
-      if self.gt_includes_bg is False:
-        classes_num-=1
+      out_ch = self.out_ch 
     else: 
-      classes_num = 1
+      out_ch = 1
+    
+    #initialize wrt channels position
     if self.channels_last is True:
-      input_shape = (self.batch_size, *self.dim_crop, self.channels_num)
-      output_shape = (self.batch_size, *self.dim_crop, classes_num)
+      input_shape = (self.batch_size, *self.dim_crop, self.in_ch)
+      output_shape = (self.batch_size, *self.dim_crop, out_ch)
     else: 
-      input_shape = (self.batch_size, self.channels_num, *self.dim_crop)
-      output_shape = (self.batch_size, classes_num,  *self.dim_crop)
-
+      input_shape = (self.batch_size, self.in_ch, *self.dim_crop)
+      output_shape = (self.batch_size, out_ch,  *self.dim_crop)
     X = np.zeros(input_shape, dtype=np.float64)
     y = np.zeros(output_shape, dtype=np.float64)
     
-    # X = []
-    # y = []
+
     for i, ID in enumerate(indexes):
       if self.verbose == 1:
-        print("Training on: %s" % self.image_list[ID])
-      img = np.array(nib.load(self.image_list[ID]).get_fdata())
+        print("Training on: %s" % self.img_list[ID])
+      
+      #read img and ground truth
+      img = np.array(nib.load(self.img_list[ID]).get_fdata())
       gt = np.array(nib.load(self.gt_list[ID]).get_fdata())
-      gt[gt>0]-=202 
-      if self.crop:
-        img, gt = self.random_crop(img, gt, self.bg_threshold)
+      # in the dataset lablel of images are as follow
+      # background:0, aorta:203, lv:204, pa:205, ra:206, svc:207, ivc:208, la:209, rv:210
+      # and keras requires from 0 to 8
+      gt[gt>0]-=202       
+      #crop the images
+      img, gt = self.random_crop(img, gt, self.bg_threshold)
         
+      #normalize the images  
       if self.normalize:
         img = self.z_normalize_img(img)
-
-
+   
       if self.channels_last is True:
         img = np.expand_dims(img, axis=3)
       else:
         img = np.expand_dims(img, axis=0)
 
       if self.to_categorical:   
-        gt = keras.utils.to_categorical(gt, num_classes=self.classes_num)
-        if self.gt_includes_bg is False:
-          gt = gt[:, :, :, 1:]
+        #to_categorical adds the channels to the last
+        gt = keras.utils.to_categorical(gt, num_classes=self.out_ch)
       else:
         gt = np.expand_dims(gt, axis=3)
-
+      #move the channels of gt based on the CHANNLES_LAST
       if self.channels_last is False: 
         gt = np.moveaxis(gt, -1, 0)
+        
+      #insert the image and gt  
       X[i, 0:img.shape[0], 0:img.shape[1], 0:img.shape[2], 0:img.shape[3]] = img
       y[i, 0:gt.shape[0], 0:gt.shape[1], 0:gt.shape[2], 0:gt.shape[3]] = gt
+      
+      #if a crop dim is bigger than the dimension of image, assign the outer parts to backgournd   
+      if self.channels_last is True:
+        y[i, gt.shape[0]:, :, :, 0]=1.
+        y[i, :, gt.shape[1]:, :, 0]=1.
+        y[i, :, :, gt.shape[2]:, 0]=1.
+      else:
+        y[i, 0, gt.shape[1]:, :, : ]=1.
+        y[i, 0, :, gt.shape[2]:, :]=1.
+        y[i, 0, :, :, gt.shape[3]:]=1.
+                  
     return X, y
 
   def random_crop(self, img, gt, bg_threshold=.80, max_tries=100000):
@@ -119,7 +132,7 @@ class VolumeDataGenerator(keras.utils.Sequence):
       start_x = np.random.randint(orig_x - output_x + 1) if orig_x>output_x else 0
       start_y = np.random.randint(orig_y - output_y + 1) if orig_y>output_y else 0
       start_z = np.random.randint(orig_z - output_z + 1) if orig_z>output_z else 0
-
+      # sometimes image size is bigger than crop size and in this occation no crop is performed
       range_x = slice(start_x, start_x + output_x) if orig_x>output_x else slice(orig_x)
       range_y = slice(start_y, start_y + output_y) if orig_y>output_y else slice(orig_y)
       range_z = slice(start_z, start_z + output_z) if orig_z>output_z else slice(orig_z)
@@ -139,7 +152,7 @@ class VolumeDataGenerator(keras.utils.Sequence):
     
   def z_normalize_img(self, img):
     """
-    Normalize the image so that the mean value for each image
+    Normalize the img so that the mean value for each img
     is 0 and the standard deviation is 1.
     """
     normalized_img = np.zeros(img.shape)
@@ -161,24 +174,36 @@ class VolumeDataGenerator(keras.utils.Sequence):
     
 def concat_h(imgs, mode='L'):
   'modes: L for gray images and RGB for colored images'
-
   shapes = [i.shape for i in imgs]
   w = ([i[1] for i in shapes])
   h = ([i[0] for i in shapes])
-  imgs = [PIL.Image.fromarray(cv2.normalize(i, None, alpha=0, beta=255,
+    
+  if mode is 'L':
+    imgs = [PIL.Image.fromarray((i*255).astype(np.uint8)) for i in imgs]
+  elif mode is 'RGB':
+    imgs = [PIL.Image.fromarray(cv2.normalize(i, None, alpha=0, beta=255,
                         norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F).astype(
                         np.uint8), mode = mode)
                         for i in imgs] 
-  dst = PIL.Image.new(mode, (np.sum(w), np.max(h)), color=(255, 255, 255) if mode=='RGB' else 255)
+
+  dst = PIL.Image.new(mode, (np.sum(w)+len(imgs)*5, np.max(h)), color=(128, 128, 128) if mode=='RGB' else 128)
   dst.paste(imgs[0], (0, 0))
   for i, img in enumerate(imgs[1:]):
     dst.paste(imgs[1:][i], (np.sum(w[:i+1])+5*(i+1), 0))
   return dst
 
 
+def concat_v_pil(imgs, mode='L'):
+  'modes: L for gray images and RGB for colored images'
+  w = imgs[0].size[0]
+  h = imgs[0].size[1]
+  dst = PIL.Image.new(mode, (w, len(imgs)*(h+5)), color=(128, 128, 128) if mode=='RGB' else 128)
+  dst.paste(imgs[0], (0, 0))
+  for i, img in enumerate(imgs[1:]):
+    dst.paste(imgs[1:][i], (0, h*(i+1)+5*(i+1)))
+  return dst
 
-
-def visualize_volume(img, gt, num_slices = 7):
+def visualize_volume(img, gt, num_slices = 10):
   # images and gts
   img_rgb = np.stack((img, img, img), axis=3)
   coronal_img = np.flip(img_rgb, axis=2)
@@ -218,19 +243,40 @@ def visualize_volume(img, gt, num_slices = 7):
   sagital_img_colored[sagital_gt>0] = 0
   sagital_img_colored = sagital_img_colored + sagital_gt_colored
 
+    
+  out_coronal_llb = concat_h([coronal_gt_colored[i, :, :, :] for i in range(0, coronal_gt_colored.shape[0], coronal_gt_colored.shape[0]//num_slices)], mode='RGB') 
+  out_coronal_img = concat_h([coronal_img[i, :, :, :] for i in range(0, coronal_img.shape[0], coronal_img.shape[0]//num_slices)], mode='RGB')
+  out_coronal_comb = concat_h([coronal_img_colored[i, :, :, :] for i in range(0, coronal_img_colored.shape[0], coronal_img_colored.shape[0]//num_slices)], mode='RGB')
 
-  display(concat_h([coronal_gt_colored[i, :, :, :] for i in range(0, coronal_gt_colored.shape[0], coronal_gt_colored.shape[0]//num_slices)], mode='RGB'))
-  display(concat_h([coronal_img[i, :, :, :] for i in range(0, coronal_img.shape[0], coronal_img.shape[0]//num_slices)], mode='RGB'))
-  display(concat_h([coronal_img_colored[i, :, :, :] for i in range(0, coronal_img_colored.shape[0], coronal_img_colored.shape[0]//num_slices)], mode='RGB'))
 
-  display(concat_h([axial_gt_colored[:, i, :, :] for i in range(0, axial_gt_colored.shape[1], axial_gt_colored.shape[1]//num_slices)], mode='RGB'))
-  display(concat_h([axial_img[:, i, :, :] for i in range(0, axial_img.shape[1], axial_img.shape[1]//num_slices)], mode='RGB'))
-  display(concat_h([axial_img_colored[:, i, :, :] for i in range(0, axial_img_colored.shape[1], axial_img_colored.shape[1]//num_slices)], mode='RGB'))
+  out_axial_llb = concat_h([axial_gt_colored[:, i, :, :] for i in range(0, axial_gt_colored.shape[1], axial_gt_colored.shape[1]//num_slices)], mode='RGB')
+  out_axial_img = concat_h([axial_img[:, i, :, :] for i in range(0, axial_img.shape[1], axial_img.shape[1]//num_slices)], mode='RGB')
+  out_axial_comb = concat_h([axial_img_colored[:, i, :, :] for i in range(0, axial_img_colored.shape[1], axial_img_colored.shape[1]//num_slices)], mode='RGB')
 
-  display(concat_h([sagital_gt_colored[:, :, i, :] for i in range(0, sagital_gt_colored.shape[2], sagital_gt_colored.shape[2]//num_slices)], mode='RGB'))
-  display(concat_h([sagital_img[:, :, i, :] for i in range(0, sagital_img.shape[2], sagital_img.shape[2]//num_slices)], mode='RGB'))
-  display(concat_h([sagital_img_colored[:, :, i, :] for i in range(0, sagital_img_colored.shape[2], sagital_img_colored.shape[2]//num_slices)], mode='RGB'))
 
+  out_sagital_llb = concat_h([sagital_gt_colored[:, :, i, :] for i in range(0, sagital_gt_colored.shape[2], sagital_gt_colored.shape[2]//num_slices)], mode='RGB')
+  out_sagital_img = concat_h([sagital_img[:, :, i, :] for i in range(0, sagital_img.shape[2], sagital_img.shape[2]//num_slices)], mode='RGB')
+  out_sagital_comb = concat_h([sagital_img_colored[:, :, i, :] for i in range(0, sagital_img_colored.shape[2], sagital_img_colored.shape[2]//num_slices)], mode='RGB')
+  
+  #display(out_coronal_llb)
+  #display(out_coronal_img)
+  #display(out_coronal_comb)
+  
+  #display(out_axial_llb)
+  #display(out_axial_img)
+  #display(out_axial_comb)
+  
+  #display(out_sagital_llb)
+  #display(out_sagital_img)
+  #display(out_sagital_comb)
+  
+   
+  out = [out_coronal_llb, out_coronal_img, out_axial_llb, out_axial_img, out_sagital_llb, out_sagital_img]
+
+  out = concat_v_pil(out, mode='RGB')
+
+  
+  return out
 
 
 
@@ -294,7 +340,7 @@ def make_gif(img, gt):
 
 
 
-def undo_categorical(gt, channels_last=False):
+def undo_categorical(gt, channels_last=True):
   'img must be in the format of (b x y z c) or (b c x y z)'
   axis = -1 if channels_last is True else 0
   return np.argmax(gt[0, :, :, :, :], axis=axis)
@@ -302,12 +348,22 @@ def undo_categorical(gt, channels_last=False):
 
 
 
-def visualize_gt(gt, num_slices = 7):
+def visualize_gt(gt, channels_last=True, num_slices = 10):
   # images and gts
   coronal_gt = np.flip(gt, axis=2)
-  for lbl in range(9):
-    display(concat_h([coronal_gt[slc, :, :, lbl] for slc in range(0, coronal_gt.shape[0], coronal_gt.shape[0]//num_slices)], mode='L'))
+  
 
+  #for lbl in range(9):
+  #  display(concat_h([coronal_gt[slc, :, :, lbl] for slc in range(0, coronal_gt.shape[0], coronal_gt.shape[0]//num_slices)], mode='L'))
+  
+  if channels_last is True:
+    out = [concat_h([coronal_gt[slc, :, :, lbl] for slc in range(0, coronal_gt.shape[0], coronal_gt.shape[0]//num_slices)], mode='L') for lbl in range(9)]
+  else:
+    out = [concat_h([coronal_gt[lbl, slc, :, :] for slc in range(0, coronal_gt.shape[1], coronal_gt.shape[1]//num_slices)], mode='L') for lbl in range(9)]
+  
+  out = concat_v_pil(out, mode='L')
+  return out
+  
 
 
 
