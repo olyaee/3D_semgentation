@@ -6,8 +6,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow.keras as keras
-import nibabel as nib
 import PIL
+import SimpleITK as sitk
+from augmentations import *
 
 class VolumeDataGenerator(keras.utils.Sequence):
   def __init__(self,
@@ -17,13 +18,17 @@ class VolumeDataGenerator(keras.utils.Sequence):
               shuffle=True,
               in_ch=1,
               out_ch=9,
-              crop = True,
+              crop = 'train_crop',
               dim_crop=(160, 160, 16), 
               bg_threshold=.9, 
               normalize=True,
+              augment=True,
               to_categorical=True,
               channels_last=True,
               verbose=1):
+    '''
+    crop: one of the following optins. 'train_crop', 'test_crop', 'false'
+    '''
     self.img_list = img_list
     self.gt_list = gt_list
     self.batch_size = batch_size
@@ -35,10 +40,8 @@ class VolumeDataGenerator(keras.utils.Sequence):
     self.dim_crop = dim_crop
     self.bg_threshold = bg_threshold
     self.verbose = verbose
-    if self.crop is False:
-      self.dim_crop = (224, 224, 224) # change it based on the complete dataset
-
     self.normalize = normalize
+    self.augment = augment
     self.to_categorical = to_categorical
     self.channels_last = channels_last
     self.on_epoch_end()
@@ -52,6 +55,63 @@ class VolumeDataGenerator(keras.utils.Sequence):
     if self.shuffle == True:
       np.random.shuffle(self.id_list)
 
+  def pad(self, vol):
+    size = vol.GetSize()
+
+    if self.crop is 'false':
+      return vol
+    
+    elif self.crop is 'train_crop':
+      max = [np.max((i, j)) for i, j in zip(size, self.dim_crop)]
+
+    elif self.crop is 'test_crop':
+      max = [((np.argwhere(np.arange(20)*16>dim)[0])*16).item() for dim in size]
+      
+    else:
+      raise ValueError('crop option is no valid!')
+
+    pad1 = [int(np.ceil((m-s)/2)) for m, s in zip(max, size)]
+    pad2 = [int(np.floor((m-s)/2)) for m, s in zip(max, size)]
+
+    return sitk.ConstantPad(vol, pad1 ,pad2, 0)
+
+
+  def reset_sitk_params(self, img, gt):
+    img = sitk.GetArrayFromImage(img)
+    gt = sitk.GetArrayFromImage(gt)
+    # in the dataset lablel of images are as follow
+    # background:0, aorta:203, lv:204, pa:205, ra:206, svc:207, ivc:208, la:209, rv:210
+    # and keras requires from 0 to 8
+    gt[gt>0]-=202 
+    return sitk.GetImageFromArray(img), sitk.GetImageFromArray(gt)
+
+
+  def do_augment(self, img, gt):
+    # add noise or smoothing
+    SN = SmoothOrNoise(prob=0.5)
+    img = SN.apply_transform(img)
+
+
+    T = Translate(prob=0.5, t_min=-20, t_max=20).get_transform(img)
+    S = Scale(prob=.5, min_sc=0.9, max_sc=1.1, same=True).get_transform(img)
+    R = Rotate(prob_x=.5, prob_y=.5, prob_z=.5, alpha_min=-45, alpha_max=45).get_transform(img)
+    F = Flip(prob_x=.5, prob_y=.5, prob_z=.5).get_transform(img)
+    D = RadialDistortion(.3).get_transform(img)
+
+    composite = sitk.Transform(3, sitk.sitkComposite)
+    if T is not None: composite.AddTransform(T) 
+    if S is not None: composite.AddTransform(S)
+    if R is not None: composite.AddTransform(R)
+    if F is not None: composite.AddTransform(F)
+    if D is not None: composite.AddTransform(D)
+
+
+    interp = sitk.sitkNearestNeighbor
+    img_resampled = sitk.Resample(img, composite, interp, 0.0)
+    gt_resampled = sitk.Resample(gt, composite, interp, 0.0)
+    
+    return img_resampled, gt_resampled
+
   def __data_generation(self, indexes):
     'Generates data containing batch_size samples'
     #set output channels
@@ -61,65 +121,77 @@ class VolumeDataGenerator(keras.utils.Sequence):
       out_ch = 1
     
     #initialize wrt channels position
-    if self.channels_last is True:
-      input_shape = (self.batch_size, *self.dim_crop, self.in_ch)
-      output_shape = (self.batch_size, *self.dim_crop, out_ch)
-    else: 
-      input_shape = (self.batch_size, self.in_ch, *self.dim_crop)
-      output_shape = (self.batch_size, out_ch,  *self.dim_crop)
-    X = np.zeros(input_shape, dtype=np.float64)
-    y = np.zeros(output_shape, dtype=np.float64)
-    
+    if self.crop is 'train_crop':
+      if self.channels_last is True:
+        input_shape = (self.batch_size, *self.dim_crop, self.in_ch)
+        output_shape = (self.batch_size, *self.dim_crop, out_ch)
+      else: 
+        input_shape = (self.batch_size, self.in_ch, *self.dim_crop)
+        output_shape = (self.batch_size, out_ch,  *self.dim_crop)
+      X = np.zeros(input_shape, dtype=np.float64)
+      y = np.zeros(output_shape, dtype=np.float64)
 
     for i, ID in enumerate(indexes):
       if self.verbose == 1:
         print("Training on: %s" % self.img_list[ID])
       
       #read img and ground truth
-      img = np.array(nib.load(self.img_list[ID]).get_fdata())
-      gt = np.array(nib.load(self.gt_list[ID]).get_fdata())
-      # in the dataset lablel of images are as follow
-      # background:0, aorta:203, lv:204, pa:205, ra:206, svc:207, ivc:208, la:209, rv:210
-      # and keras requires from 0 to 8
-      gt[gt>0]-=202       
-      #crop the images
-      img, gt = self.random_crop(img, gt, self.bg_threshold)
-        
-      #normalize the images  
+      img = sitk.ReadImage(self.img_list[ID])
+      gt = sitk.ReadImage(self.gt_list[ID])
+
+      img, gt = self.reset_sitk_params(img, gt)
+
       if self.normalize:
-        img = self.z_normalize_img(img)
-   
-      if self.channels_last is True:
-        img = np.expand_dims(img, axis=3)
-      else:
-        img = np.expand_dims(img, axis=0)
+         img = self.z_normalize_img(img)
 
-      if self.to_categorical:   
-        #to_categorical adds the channels to the last
-        gt = keras.utils.to_categorical(gt, num_classes=self.out_ch)
-      else:
-        gt = np.expand_dims(gt, axis=3)
-      #move the channels of gt based on the CHANNLES_LAST
-      if self.channels_last is False: 
-        gt = np.moveaxis(gt, -1, 0)
-        
-      #insert the image and gt  
-      X[i, 0:img.shape[0], 0:img.shape[1], 0:img.shape[2], 0:img.shape[3]] = img
-      y[i, 0:gt.shape[0], 0:gt.shape[1], 0:gt.shape[2], 0:gt.shape[3]] = gt
+      # if self.crop is 'train_crop':
+      img = self.pad(img)
+      gt = self.pad(gt)
+      img, gt = self.random_crop(img, gt, self.bg_threshold)
+
+      if self.augment:
+        img, gt = self.do_augment(img, gt)
+
+      img = sitk.GetArrayFromImage(img)
+      gt = sitk.GetArrayFromImage(gt)
       
-      #if a crop dim is bigger than the dimension of image, assign the outer parts to backgournd   
-      if self.channels_last is True:
-        y[i, gt.shape[0]:, :, :, 0]=1.
-        y[i, :, gt.shape[1]:, :, 0]=1.
-        y[i, :, :, gt.shape[2]:, 0]=1.
-      else:
-        y[i, 0, gt.shape[1]:, :, : ]=1.
-        y[i, 0, :, gt.shape[2]:, :]=1.
-        y[i, 0, :, :, gt.shape[3]:]=1.
-                  
-    return X, y
+      #sitk has an special dimension order and needs to be corrected
+      img = np.moveaxis(img, [0, 1, 2], [2, 1, 0])
+      gt = np.moveaxis(gt, [0, 1, 2], [2, 1, 0])
 
-  def random_crop(self, img, gt, bg_threshold=.80, max_tries=100000):
+      if self.to_categorical:
+        #to_categorical adds the channels to the last
+        gt = keras.utils.to_categorical(gt, num_classes=9)
+      else: 
+        gt = np.expand_dims(gt, axis=-1)
+
+
+      if self.channels_last is True:
+        # print(img.shape)
+        img = np.expand_dims(img, 3)
+      else:
+        img = np.expand_dims(img, 0)
+        #move the channels of gt based on the CHANNLES_LAST
+        gt = np.moveaxis(gt, -1, 0)
+
+      # if the crop is False we can skip predefined output shape
+      # note that if crop is false the batch size has be be 1
+      if self.crop is 'false' or self.crop is 'test_crop':
+        return np.expand_dims(img, 0), np.expand_dims(gt, 0)
+
+      #insert the image and gt 
+      X[i, ] = img
+      y[i, ] = gt
+
+    return X, y
+                  
+  def random_crop(self, img, gt, bg_threshold=.90, max_tries=15):
+    if self.crop is 'false' or self.crop is 'test_crop':
+      return img, gt
+
+    img = sitk.GetArrayFromImage(img)
+    gt = sitk.GetArrayFromImage(gt)
+
     orig_x, orig_y, orig_z = img.shape[:]
     output_x, output_y, output_z = self.dim_crop
 
@@ -148,19 +220,29 @@ class VolumeDataGenerator(keras.utils.Sequence):
         # make copy of the sub-volume
         X = np.copy(img[range_x, range_y, range_z])
 
+        X = sitk.GetImageFromArray(X)
+        y = sitk.GetImageFromArray(y)
         return X, y
+        
+    X = np.copy(img[range_x, range_y, range_z])
+    X = sitk.GetImageFromArray(X)
+    y = sitk.GetImageFromArray(y)
+    return X, y
     
   def z_normalize_img(self, img):
     """
     Normalize the img so that the mean value for each img
     is 0 and the standard deviation is 1.
     """
+    img = sitk.GetArrayFromImage(img)
     normalized_img = np.zeros(img.shape)
 
     for channel in range(img.shape[-1]):
       img_temp = img[:, :, channel]
       img_temp = (img_temp - np.mean(img_temp)) / np.std(img_temp)
-      normalized_img[:, :, channel] = img_temp
+      normalized_img[:, :, channel] = img_temp    
+      
+    normalized_img = sitk.GetImageFromArray(normalized_img)
     return normalized_img
 
   def __getitem__(self, index):
@@ -364,23 +446,3 @@ def visualize_gt(gt, channels_last=True, num_slices = 10):
   out = concat_v_pil(out, mode='L')
   return out
   
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
